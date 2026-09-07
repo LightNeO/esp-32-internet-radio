@@ -8,7 +8,7 @@
 An open-source desktop Internet Radio built on the **ESP32-S3 DevKitC-1 (N16R8)**. Features lossless digital I2S audio via dual **MAX98357A** DAC/amplifiers, an animated 0.96" I2C OLED display with word-wrapped station titles and a real-time mini equalizer, a tactile 4-button control layout with short/long press gestures, and a built-in mobile/desktop Web UI with REST API control over your local network.
 
 ---
-![ESP-32-S3_1](image.png)
+![ESP-32-S3_1](images/1.png)
 ## Features
 
 - **Zero-Code Wi-Fi Setup (Captive Portal)**: Built-in `WiFiManager` allows anyone to flash pre-built binaries and configure their local Wi-Fi from any smartphone or PC via a captive web portal without touching code. Credentials are saved permanently to NVS flash.
