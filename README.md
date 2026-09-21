@@ -5,7 +5,7 @@
 [![IDE](https://img.shields.io/badge/IDE-PlatformIO-orange.svg)](https://platformio.org/)
 [![License](https://img.shields.io/badge/License-MIT-brightgreen.svg)](LICENSE)
 
-An open-source desktop Internet Radio built on the **ESP32-S3 DevKitC-1 (N16R8)**. Features lossless digital I2S audio via dual **MAX98357A** DAC/amplifiers, an animated 0.96" I2C OLED display with word-wrapped station titles and a real-time mini equalizer, a tactile 4-button control layout with short/long press gestures, and a built-in mobile/desktop Web UI with REST API control over your local network.
+An open-source desktop Internet Radio built on the **ESP32-S3 DevKitC-1 (N16R8)**. Features lossless digital I2S audio via dual **MAX98357A** DAC/amplifiers, an animated 0.96" I2C OLED display with stations and a real-time mini equalizer, a tactile 4-button control layout with short/long press gestures, and a built-in mobile/desktop Web UI with REST API control over your local network.
 
 ---
 ![ESP-32-S3_1](/images/1.jpg)
