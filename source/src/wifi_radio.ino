@@ -66,6 +66,9 @@ bool radioPlaying = false;
 bool sleepMode = false;
 bool resumeAfterSleep = false;
 bool inConfigPortal = false;
+bool volumeSavePending = false;
+uint32_t volumeChangedAt = 0;
+constexpr uint32_t VOLUME_SAVE_DELAY_MS = 3000;
 
 void toggleRadio();
 void changeStation(int direction);
@@ -76,6 +79,7 @@ void configModeCallback(WiFiManager *myWiFiManager);
 void connectWiFi();
 void printStations();
 void printHelp();
+void setVolumeFromControl(int delta);
 
 const char RADIO_PAGE[] PROGMEM = R"rawliteral(
 <!doctype html><html lang="uk"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -247,12 +251,23 @@ void wakeRadio() {
   Serial.println("Radio: awake");
 }
 
+void setVolumeFromControl(int delta) {
+  if (sleepMode) return;
+  int nextVolume = constrain((int)volume + delta, 0, 21);
+  if (nextVolume == volume) return;
+  volume = (uint8_t)nextVolume;
+  // Apply immediately; do not write NVS in the request/button/audio path.
+  audio.setVolume(volume);
+  volumeSavePending = true;
+  volumeChangedAt = millis();
+}
+
 void handleWebCommand(const String& command) {
   if (command == "toggle" && !sleepMode) toggleRadio();
   else if (command == "next" && !sleepMode) changeStation(+1);
   else if (command == "prev" && !sleepMode) changeStation(-1);
-  else if (command == "vup" && !sleepMode) { if (volume < 21) volume++; audio.setVolume(volume); saveSettings(); }
-  else if (command == "vdown" && !sleepMode) { if (volume > 0) volume--; audio.setVolume(volume); saveSettings(); }
+  else if (command == "vup") setVolumeFromControl(+1);
+  else if (command == "vdown") setVolumeFromControl(-1);
   else if (command == "sleep") sleepRadio();
   else if (command == "wake") wakeRadio();
   webServer.send(200, "text/plain", "OK");
@@ -339,8 +354,8 @@ void handleShortPress(uint8_t index) {
   if (sleepMode) return;
   switch (index) {
     case 0: changeStation(-1); break; case 1: changeStation(+1); break;
-    case 2: if (volume > 0) volume--; audio.setVolume(volume); saveSettings(); break;
-    case 3: if (volume < 21) volume++; audio.setVolume(volume); saveSettings(); break;
+    case 2: setVolumeFromControl(-1); break;
+    case 3: setVolumeFromControl(+1); break;
   }
   updateDisplay(true);
 }
@@ -398,11 +413,15 @@ void setup() {
 void loop() {
   if (!sleepMode) { audio.loop(); updateDisplay(); }
   pollButtons(); webServer.handleClient();
+  if (volumeSavePending && millis() - volumeChangedAt >= VOLUME_SAVE_DELAY_MS) {
+    saveSettings();
+    volumeSavePending = false;
+  }
   if (Serial.available()) {
     char command = Serial.read();
     if (command >= '1' && command <= '0' + stationCount) { currentStation = command - '1'; if (!sleepMode && WiFi.status() == WL_CONNECTED) { startStation(); radioPlaying = true; } saveSettings(); }
     else switch (command) {
-      case '+': if (volume < 21) volume++; audio.setVolume(volume); saveSettings(); break; case '-': if (volume > 0) volume--; audio.setVolume(volume); saveSettings(); break;
+      case '+': setVolumeFromControl(+1); break; case '-': setVolumeFromControl(-1); break;
       case 's': if (!sleepMode) { audio.stopSong(); radioPlaying = false; } break; case 'r': if (!sleepMode && WiFi.status() == WL_CONNECTED) { startStation(); radioPlaying = true; } break;
       case 'n': if (!sleepMode) changeStation(+1); break; case 'p': if (!sleepMode) changeStation(-1); break; case 'l': printStations(); break; case 'h': printHelp(); break;
       default: break;

@@ -206,9 +206,12 @@ http://<ESP32-IP>/
 - `GET /api/toggle` — Toggles Play / Stop.
 - `GET /api/next` — Plays the next station.
 - `GET /api/prev` — Plays the previous station.
-- `GET /api/vup` — Increases volume by 1 (max 21).
-- `GET /api/vdown` — Decreases volume by 1 (min 0).
-- `GET /api/station/<id>` — Jumps directly to station index `<id>`.
+- `GET /api/vup` - Increases volume by 1 (max 21) without restarting the audio stream.
+- `GET /api/vdown` - Decreases volume by 1 (min 0) without restarting the audio stream.
+- `GET /api/station/<id>` - Jumps directly to station index `<id>`.
+
+Volume changes are applied immediately to the I2S output. NVS persistence is deferred briefly after the last change, so repeated volume presses do not block the audio loop with flash writes.
+
 
 ---
 
