@@ -1,433 +1,412 @@
-/* ESP32-S3 N16R8 Wi-Fi stereo radio + 4 buttons + 0.96 OLED
-   Two MAX98357A modules share the I2S bus; channel selection is hardware-configured.
-   Includes WiFiManager captive portal for 1-click configuration on any network.
+/* ESP32-S3 N16R8 Wi-Fi stereo radio + 4 buttons + OLED + REST API
+   Station list and settings are persisted in NVS (Preferences).
+   Sleep mode is a Wi-Fi-connected software sleep: audio and OLED stop while
+   the web server remains available for /api/wake.
 */
 #include <WiFi.h>
 #include <Wire.h>
+#include <Preferences.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <WebServer.h>
 #include <WiFiManager.h>
 #include "Audio.h"
 
-// Station list: you can freely add more stations here, STATION_COUNT adapts automatically.
-const char* stationNames[] = {
-  "Radio ROKS",
-  "KISS FM Ukraine",
-  "Lux FM",
-  "Hit FM",
-  "Lofi Beats"
+// Defaults are used only on the first boot, or after all saved stations are removed.
+struct Station {
+  String name;
+  String url;
 };
 
-const char* stationUrls[] = {
+const char* DEFAULT_NAMES[] = {
+  "Radio ROKS", "KISS FM Ukraine", "Lux FM", "Hit FM", "Lofi Beats"
+};
+const char* DEFAULT_URLS[] = {
   "http://online.radioroks.ua/RadioROKS",
   "https://online.kissfm.ua/KissFM_Ukr_HD",
   "https://lux.radio.tvstitch.com/lux_lviv_adv_sd",
   "http://online.hitfm.ua/HitFM",
   "http://das-sa39.cdnstream1.com/5582_128"
 };
-
-constexpr uint8_t STATION_COUNT = sizeof(stationUrls) / sizeof(stationUrls[0]);
+constexpr uint8_t DEFAULT_STATION_COUNT = sizeof(DEFAULT_URLS) / sizeof(DEFAULT_URLS[0]);
+constexpr uint8_t MAX_STATIONS = 32;
+Station stations[MAX_STATIONS];
+uint8_t stationCount = 0;
 uint8_t currentStation = 0;
+Preferences preferences;
 
-// MAX98357A I2S bus (connect these three signals to BOTH modules).
+// MAX98357A I2S bus.
 constexpr int I2S_DOUT = 7;
 constexpr int I2S_BCLK = 15;
 constexpr int I2S_LRC = 16;
+// Set to a real amplifier enable pin if your hardware has one. -1 means unavailable.
+constexpr int AUDIO_ENABLE_PIN = -1;
 
 // Buttons to common GND; INPUT_PULLUP means pressed = LOW.
-constexpr int BUTTON_PREV = 8;        // Button 1: short prev, long play/pause
-constexpr int BUTTON_NEXT = 9;        // Button 2: short next
-constexpr int BUTTON_VOLUME_DOWN = 10;// Button 3: short vol-
-constexpr int BUTTON_VOLUME_UP = 11;  // Button 4: short vol+
+constexpr int BUTTON_PREV = 8;
+constexpr int BUTTON_NEXT = 9;
+constexpr int BUTTON_VOLUME_DOWN = 10;
+constexpr int BUTTON_VOLUME_UP = 11;
 constexpr uint32_t BUTTON_DEBOUNCE_MS = 50;
 constexpr uint32_t BUTTON_LONG_PRESS_MS = 800;
 
-// OLED SSD1306 128x64 I2C. Change these only if your wiring differs.
+// OLED SSD1306 128x64 I2C.
 constexpr int OLED_SDA = 1;
 constexpr int OLED_SCL = 2;
 constexpr uint8_t OLED_ADDRESS = 0x3C;
 Adafruit_SSD1306 display(128, 64, &Wire, -1);
 bool oledReady = false;
-String streamTitle;
 uint32_t lastDisplayUpdate = 0;
+String streamTitle;
 
 Audio audio;
 WebServer webServer(80);
 uint8_t volume = 10;
 bool radioPlaying = false;
+bool sleepMode = false;
+bool resumeAfterSleep = false;
 bool inConfigPortal = false;
 
 void toggleRadio();
 void changeStation(int direction);
 void startStation();
 void updateDisplay(bool force = false);
+void pollButtons();
+void configModeCallback(WiFiManager *myWiFiManager);
+void connectWiFi();
+void printStations();
+void printHelp();
 
 const char RADIO_PAGE[] PROGMEM = R"rawliteral(
-<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>
+<!doctype html><html lang="uk"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ESP32 Radio</title><style>
-body{font-family:Arial,sans-serif;max-width:480px;margin:30px auto;padding:0 18px;background:#111;color:#eee}
-.card{background:#222;border-radius:14px;padding:20px;text-align:center;box-shadow:0 2px 12px #000}
-h1{font-size:22px;margin:0 0 8px}p{color:#aaa}.row{display:flex;gap:10px;justify-content:center;flex-wrap:wrap}
-button{font-size:17px;padding:12px 17px;border:0;border-radius:10px;background:#1683d8;color:white;cursor:pointer}
-button:active{transform:scale(.97)}.secondary{background:#555}.stations{margin-top:18px;display:grid;gap:8px}
-</style></head><body><div class='card'><h1>ESP32 Internet Radio</h1>
-<p id='status'>Loading...</p><div class='row'><button onclick='cmd("toggle")'>Start / Stop</button><button onclick='cmd("prev")' class='secondary'>Previous</button><button onclick='cmd("next")'>Next</button></div>
-<div class='row' style='margin-top:10px'><button onclick='cmd("vdown")' class='secondary'>Volume -</button><button onclick='cmd("vup")'>Volume +</button></div>
-<div class='stations' id='stations'></div></div>
+:root{color-scheme:dark}body{font:16px system-ui,Arial;max-width:560px;margin:0 auto;padding:18px;background:#111;color:#eee}
+.card{background:#222;border-radius:14px;padding:18px;margin-bottom:14px;box-shadow:0 2px 12px #000}h1{font-size:22px;margin:0 0 8px}
+#status{color:#aaa;min-height:24px}.row{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0}
+button,input{font:inherit;border:0;border-radius:9px;padding:10px}button{background:#1683d8;color:#fff;cursor:pointer}button.secondary{background:#555}button.danger{background:#a83232}
+input{box-sizing:border-box;background:#333;color:#fff;width:100%;margin:4px 0}form{display:grid;gap:4px}.station{display:flex;gap:8px;align-items:center;border-top:1px solid #444;padding:9px 0}.station span{flex:1;overflow:hidden}.station small{display:block;color:#999;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.station button{min-width:42px}.station button.danger{font-size:22px;padding:5px 12px}label{font-size:13px;color:#bbb;margin-top:4px}
+</style></head><body><div class="card"><h1>ESP32 Internet Radio</h1><div id="status">Завантаження…</div>
+<div class="row"><button onclick="cmd('/api/toggle')">Start / Stop</button><button class="secondary" onclick="cmd('/api/prev')">◀ Previous</button><button onclick="cmd('/api/next')">Next ▶</button></div>
+<div class="row"><button class="secondary" onclick="cmd('/api/vdown')">Volume −</button><button onclick="cmd('/api/vup')">Volume +</button></div>
+<div class="row"><button class="secondary" onclick="cmd('/api/sleep')">Sleep</button><button onclick="cmd('/api/wake')">Wake</button></div></div>
+<div class="card"><h2>Radio Stations</h2><div id="stations"></div><h3>Add a station</h3><form id="addStationForm" onsubmit="addStation(event)"><label for="stationName">Station name</label><input id="stationName" required maxlength="48" autocomplete="off" placeholder="For example: My Radio"><label for="stationUrl">Audio stream URL</label><input id="stationUrl" required type="url" autocomplete="off" placeholder="https://example.com/stream.mp3"><button type="submit">Save station</button></form></div>
 <script>
-const cmd = async (c) => { await fetch('/api/' + c); update(); };
-const update = async () => { let s = await (await fetch('/api/status')).json(); document.getElementById('status').textContent = (s.playing ? 'Playing: ' : 'Stopped: ') + s.station + ' | Volume ' + s.volume + '/21'; let d = document.getElementById('stations'); d.innerHTML = ''; s.stations.forEach((n, i) => { let b = document.createElement('button'); b.textContent = n; b.onclick = () => { fetch('/api/station/' + i).then(update); }; d.appendChild(b); }); };
-update(); setInterval(update, 3000);
+const api=async(u,o)=>{let r=await fetch(u,o);if(!r.ok){let t=await r.text();throw Error(t||('HTTP '+r.status))}return r};
+const cmd=async(u)=>{try{await api(u);await update()}catch(e){alert('Error: '+e.message)}};
+const removeStation=async(i,label)=>{if(confirm('Delete station \"'+label+'\"?'))await cmd('/api/stations/delete?id='+i)};
+const addStation=async(e)=>{e.preventDefault();let nameInput=document.getElementById('stationName'),urlInput=document.getElementById('stationUrl');try{await api('/api/stations/add',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({name:nameInput.value.trim(),url:urlInput.value.trim()})});nameInput.value='';urlInput.value='';await update()}catch(x){alert('Could not save station: '+x.message)}};
+const update=async()=>{try{let s=await (await api('/api/status')).json(),statusEl=document.getElementById('status'),stationsEl=document.getElementById('stations');statusEl.textContent=(s.sleeping?'Sleeping | ':'')+(s.playing?'Playing: ':'Stopped | ')+s.station+' | Volume '+s.volume+'/21 | IP '+s.ip;stationsEl.innerHTML='';s.stations.forEach((x,i)=>{let d=document.createElement('div');d.className='station';let info=document.createElement('span'),title=document.createElement('b'),urlText=document.createElement('small'),play=document.createElement('button'),remove=document.createElement('button');title.textContent=x.name;urlText.textContent=x.url;info.append(title,urlText);play.textContent='▶';play.onclick=()=>cmd('/api/station/'+i);remove.textContent='×';remove.title='Delete station';remove.className='danger';remove.onclick=()=>removeStation(i,x.name);d.append(info,play,remove);stationsEl.appendChild(d)})}catch(e){document.getElementById('status').textContent='Connection error'}};
+update();setInterval(update,3000);
 </script></body></html>
 )rawliteral";
 
-void sendStatus() {
-  String json = "{\"playing\":" + String(radioPlaying ? "true" : "false") +
-    ",\"station\":\"" + String(stationNames[currentStation]) +
-    "\",\"volume\":" + String(volume) + ",\"stations\":[";
-  for (uint8_t i = 0; i < STATION_COUNT; i++) {
-    if (i) json += ",";
-    json += "\"" + String(stationNames[i]) + "\"";
+String jsonEscape(const String& value) {
+  String out;
+  out.reserve(value.length() + 8);
+  for (size_t i = 0; i < value.length(); i++) {
+    char c = value[i];
+    if (c == '\\') out += "\\\\";
+    else if (c == '"') out += "\\\"";
+    else if (c == '\n') out += "\\n";
+    else if (c == '\r') out += "\\r";
+    else out += c;
   }
-  json += "]}";
-  webServer.send(200, "application/json", json);
+  return out;
 }
 
-void handleWebCommand(const String& command) {
-  if (command == "toggle") toggleRadio();
-  else if (command == "next") changeStation(+1);
-  else if (command == "prev") changeStation(-1);
-  else if (command == "vup") { if (volume < 21) volume++; audio.setVolume(volume); }
-  else if (command == "vdown") { if (volume > 0) volume--; audio.setVolume(volume); }
+void saveSettings() {
+  preferences.begin("radio", false);
+  preferences.putUChar("count", stationCount);
+  preferences.putUChar("current", currentStation);
+  preferences.putUChar("volume", volume);
+  for (uint8_t i = 0; i < MAX_STATIONS; i++) {
+    String nameKey = "n" + String(i);
+    String urlKey = "u" + String(i);
+    if (i < stationCount) {
+      preferences.putString(nameKey.c_str(), stations[i].name);
+      preferences.putString(urlKey.c_str(), stations[i].url);
+    } else {
+      preferences.remove(nameKey.c_str());
+      preferences.remove(urlKey.c_str());
+    }
+  }
+  preferences.end();
+}
+
+void loadSettings() {
+  preferences.begin("radio", true);
+  uint8_t savedCount = preferences.getUChar("count", 0);
+  volume = min<uint8_t>(preferences.getUChar("volume", 10), 21);
+  currentStation = preferences.getUChar("current", 0);
+  if (savedCount == 0 || savedCount > MAX_STATIONS) {
+    stationCount = DEFAULT_STATION_COUNT;
+    for (uint8_t i = 0; i < stationCount; i++) {
+      stations[i].name = DEFAULT_NAMES[i];
+      stations[i].url = DEFAULT_URLS[i];
+    }
+    currentStation = 0;
+    preferences.end();
+    saveSettings();
+    return;
+  }
+  stationCount = savedCount;
+  for (uint8_t i = 0; i < stationCount; i++) {
+    stations[i].name = preferences.getString(("n" + String(i)).c_str(), "Station");
+    stations[i].url = preferences.getString(("u" + String(i)).c_str(), "");
+  }
+  preferences.end();
+  if (currentStation >= stationCount) currentStation = 0;
+}
+
+void sendStatus() {
+  String json = "{\"playing\":" + String(radioPlaying ? "true" : "false") +
+    ",\"sleeping\":" + String(sleepMode ? "true" : "false") +
+    ",\"volume\":" + String(volume) +
+    ",\"stationIndex\":" + String(currentStation) +
+    ",\"station\":\"" + jsonEscape(stations[currentStation].name) +
+    "\",\"ip\":\"" + WiFi.localIP().toString() + "\",\"stations\":[";
+  for (uint8_t i = 0; i < stationCount; i++) {
+    if (i) json += ",";
+    json += "{\"name\":\"" + jsonEscape(stations[i].name) +
+      "\",\"url\":\"" + jsonEscape(stations[i].url) + "\"}";
+  }
+  json += "]}";
+  webServer.send(200, "application/json; charset=utf-8", json);
+}
+
+void sendError(int code, const char* message) {
+  webServer.send(code, "application/json", String("{\"error\":\"") + jsonEscape(message) + "\"}");
+}
+
+bool validStreamUrl(const String& url) {
+  return (url.startsWith("http://") || url.startsWith("https://")) && url.length() <= 240;
+}
+
+void apiAddStation() {
+  if (stationCount >= MAX_STATIONS) { sendError(409, "Station limit reached"); return; }
+  String name = webServer.arg("name");
+  String url = webServer.arg("url");
+  name.trim(); url.trim();
+  if (name.length() == 0 || name.length() > 48 || !validStreamUrl(url)) {
+    sendError(400, "Name or stream URL is invalid"); return;
+  }
+  stations[stationCount].name = name;
+  stations[stationCount].url = url;
+  stationCount++;
+  saveSettings();
+  webServer.send(201, "application/json", "{\"ok\":true}");
+}
+
+void apiDeleteStation() {
+  if (!webServer.hasArg("id")) { sendError(400, "Missing station id"); return; }
+  int index = webServer.arg("id").toInt();
+  if (index < 0 || index >= stationCount) { sendError(404, "Station not found"); return; }
+  if (stationCount == 1) { sendError(409, "At least one station must remain"); return; }
+  bool deletedCurrent = currentStation == index;
+  for (int i = index; i < stationCount - 1; i++) stations[i] = stations[i + 1];
+  stationCount--;
+  if (currentStation > index || deletedCurrent) currentStation = min<uint8_t>(currentStation, stationCount - 1);
+  saveSettings();
+  if (deletedCurrent && radioPlaying) startStation();
+  webServer.send(200, "application/json", "{\"ok\":true}");
+}
+
+void apiStationByPath(const String& path) {
+  int index = path.substring(String("/api/station/").length()).toInt();
+  if (index < 0 || index >= stationCount) { sendError(404, "Station not found"); return; }
+  currentStation = index;
+  saveSettings();
+  if (!sleepMode && WiFi.status() == WL_CONNECTED) { startStation(); radioPlaying = true; }
   webServer.send(200, "text/plain", "OK");
   updateDisplay(true);
 }
 
+void sleepRadio() {
+  if (sleepMode) return;
+  resumeAfterSleep = radioPlaying;
+  audio.stopSong();
+  radioPlaying = false;
+  sleepMode = true;
+  if (AUDIO_ENABLE_PIN >= 0) digitalWrite(AUDIO_ENABLE_PIN, LOW);
+  if (oledReady) display.ssd1306_command(SSD1306_DISPLAYOFF);
+  Serial.println("Radio: sleep mode (Wi-Fi remains connected)");
+}
+
+void wakeRadio() {
+  if (!sleepMode) return;
+  sleepMode = false;
+  if (AUDIO_ENABLE_PIN >= 0) digitalWrite(AUDIO_ENABLE_PIN, HIGH);
+  if (oledReady) display.ssd1306_command(SSD1306_DISPLAYON);
+  audio.setVolume(volume);
+  if (resumeAfterSleep && WiFi.status() == WL_CONNECTED) {
+    startStation();
+    radioPlaying = true;
+  }
+  resumeAfterSleep = false;
+  updateDisplay(true);
+  Serial.println("Radio: awake");
+}
+
+void handleWebCommand(const String& command) {
+  if (command == "toggle" && !sleepMode) toggleRadio();
+  else if (command == "next" && !sleepMode) changeStation(+1);
+  else if (command == "prev" && !sleepMode) changeStation(-1);
+  else if (command == "vup" && !sleepMode) { if (volume < 21) volume++; audio.setVolume(volume); saveSettings(); }
+  else if (command == "vdown" && !sleepMode) { if (volume > 0) volume--; audio.setVolume(volume); saveSettings(); }
+  else if (command == "sleep") sleepRadio();
+  else if (command == "wake") wakeRadio();
+  webServer.send(200, "text/plain", "OK");
+  updateDisplay(true);
+}
+
+void handleNotFound() {
+  String path = webServer.uri();
+  if (path.startsWith("/api/station/") && webServer.method() == HTTP_GET) {
+    apiStationByPath(path); return;
+  }
+  sendError(404, "Not found");
+}
+
 void startWebServer() {
-  webServer.on("/", HTTP_GET, []() { webServer.send_P(200, "text/html", RADIO_PAGE); });
+  webServer.on("/", HTTP_GET, []() { webServer.send_P(200, "text/html; charset=utf-8", RADIO_PAGE); });
   webServer.on("/api/status", HTTP_GET, sendStatus);
   webServer.on("/api/toggle", HTTP_GET, []() { handleWebCommand("toggle"); });
   webServer.on("/api/next", HTTP_GET, []() { handleWebCommand("next"); });
   webServer.on("/api/prev", HTTP_GET, []() { handleWebCommand("prev"); });
   webServer.on("/api/vup", HTTP_GET, []() { handleWebCommand("vup"); });
   webServer.on("/api/vdown", HTTP_GET, []() { handleWebCommand("vdown"); });
-  for (uint8_t i = 0; i < STATION_COUNT; i++) {
-    webServer.on(String("/api/station/") + i, HTTP_GET, [i]() {
-      currentStation = i;
-      startStation();
-      radioPlaying = true;
-      webServer.send(200, "text/plain", "OK");
-      updateDisplay(true);
-    });
-  }
+  webServer.on("/api/sleep", HTTP_GET, []() { handleWebCommand("sleep"); });
+  webServer.on("/api/wake", HTTP_GET, []() { handleWebCommand("wake"); });
+  webServer.on("/api/stations/add", HTTP_POST, apiAddStation);
+  webServer.on("/api/stations/add", HTTP_GET, apiAddStation);
+  webServer.on("/api/stations/delete", HTTP_POST, apiDeleteStation);
+  webServer.on("/api/stations/delete", HTTP_GET, apiDeleteStation);
+  webServer.onNotFound(handleNotFound);
   webServer.begin();
-  Serial.println("Web control: http://<ESP32-IP>/");
+  Serial.print("Web control: http://"); Serial.print(WiFi.localIP()); Serial.println("/");
 }
 
-struct ButtonState {
-  int pin;
-  bool stableState;
-  bool lastReading;
-  uint32_t lastChange;
-  uint32_t pressedAt;
-  bool longPressHandled;
-};
+struct ButtonState { int pin; bool stableState; bool lastReading; uint32_t lastChange; uint32_t pressedAt; bool longPressHandled; };
 ButtonState buttons[] = {
-  {BUTTON_PREV, HIGH, HIGH, 0, 0, false},
-  {BUTTON_NEXT, HIGH, HIGH, 0, 0, false},
-  {BUTTON_VOLUME_DOWN, HIGH, HIGH, 0, 0, false},
-  {BUTTON_VOLUME_UP, HIGH, HIGH, 0, 0, false}
+  {BUTTON_PREV, HIGH, HIGH, 0, 0, false}, {BUTTON_NEXT, HIGH, HIGH, 0, 0, false},
+  {BUTTON_VOLUME_DOWN, HIGH, HIGH, 0, 0, false}, {BUTTON_VOLUME_UP, HIGH, HIGH, 0, 0, false}
 };
 
 void showSetupScreen(const char* apName, const char* ipAddr) {
   if (!oledReady) return;
-  display.clearDisplay();
-  display.setTextColor(SSD1306_WHITE);
-
-  display.setTextSize(1);
-  display.setCursor(18, 4);
-  display.print("WiFi Setup Mode");
-  display.drawFastHLine(0, 16, 128, SSD1306_WHITE);
-
-  display.setCursor(0, 22);
-  display.print("Connect to Wi-Fi AP:");
-  display.setCursor(4, 34);
-  display.setTextSize(1);
-  display.printf("> %s", apName);
-
-  display.setCursor(0, 48);
-  display.print("Then open browser:");
-  display.setCursor(4, 56);
-  display.printf("http://%s", ipAddr);
-
-  display.display();
+  display.clearDisplay(); display.setTextColor(SSD1306_WHITE); display.setTextSize(1);
+  display.setCursor(18, 4); display.print("WiFi Setup Mode"); display.drawFastHLine(0, 16, 128, SSD1306_WHITE);
+  display.setCursor(0, 22); display.print("Connect to Wi-Fi AP:"); display.setCursor(4, 34); display.printf("> %s", apName);
+  display.setCursor(0, 48); display.print("Then open browser:"); display.setCursor(4, 56); display.printf("http://%s", ipAddr); display.display();
 }
 
 void updateDisplay(bool force) {
-  if (inConfigPortal) return;
-  // Redraw often enough for a smooth-looking mini equalizer animation.
-  if (!oledReady || (!force && millis() - lastDisplayUpdate < 100)) return;
-  lastDisplayUpdate = millis();
-
-  display.clearDisplay();
-  display.setTextColor(SSD1306_WHITE);
-
-  // Station name only. Wrap at spaces, never in the middle of a word.
-  display.setTextSize(2);
-  String name = stationNames[currentStation];
-  String line = "";
-  int16_t y = 2;
-  int16_t x1, y1;
-  uint16_t textWidth, textHeight;
-  int wordStart = 0;
-  while (wordStart < name.length()) {
-    while (wordStart < name.length() && name[wordStart] == ' ') wordStart++;
-    if (wordStart >= name.length()) break;
-    int wordEnd = name.indexOf(' ', wordStart);
-    if (wordEnd < 0) wordEnd = name.length();
-    String word = name.substring(wordStart, wordEnd);
-    String candidate = line.length() ? line + " " + word : word;
-    display.getTextBounds(candidate.c_str(), 0, 0, &x1, &y1, &textWidth, &textHeight);
-    if (textWidth > 126 && line.length() > 0) {
-      display.getTextBounds(line.c_str(), 0, 0, &x1, &y1, &textWidth, &textHeight);
-      display.setCursor((128 - static_cast<int>(textWidth)) / 2, y);
-      display.print(line);
-      y += 17;
-      line = word;
-    } else {
-      line = candidate;
-    }
+  if (inConfigPortal || sleepMode || !oledReady || (!force && millis() - lastDisplayUpdate < 100)) return;
+  lastDisplayUpdate = millis(); display.clearDisplay(); display.setTextColor(SSD1306_WHITE); display.setTextSize(2);
+  String name = stations[currentStation].name, line = ""; int16_t y = 2, x1, y1; uint16_t w, h; int wordStart = 0;
+  while (wordStart < (int)name.length()) {
+    while (wordStart < (int)name.length() && name[wordStart] == ' ') wordStart++;
+    if (wordStart >= (int)name.length()) break;
+    int wordEnd = name.indexOf(' ', wordStart); if (wordEnd < 0) wordEnd = name.length();
+    String word = name.substring(wordStart, wordEnd), candidate = line.length() ? line + " " + word : word;
+    display.getTextBounds(candidate.c_str(), 0, 0, &x1, &y1, &w, &h);
+    if (w > 126 && line.length()) { display.getTextBounds(line.c_str(), 0, 0, &x1, &y1, &w, &h); display.setCursor((128 - (int)w) / 2, y); display.print(line); y += 17; line = word; }
+    else line = candidate;
     wordStart = wordEnd + 1;
   }
-  if (line.length() > 0 && y < 36) {
-    display.getTextBounds(line.c_str(), 0, 0, &x1, &y1, &textWidth, &textHeight);
-    display.setCursor((128 - static_cast<int>(textWidth)) / 2, y);
-    display.print(line);
-  }
-
-  // Eight-bar mini equalizer. It is an activity animation, not an audio FFT.
-  constexpr uint8_t BAR_COUNT = 8;
-  constexpr uint8_t BAR_WIDTH = 9;
-  constexpr uint8_t BAR_GAP = 6;
-  constexpr uint8_t EQ_BASELINE = 63;
-  constexpr uint8_t EQ_MAX_HEIGHT = 24;
-  const int eqWidth = BAR_COUNT * BAR_WIDTH + (BAR_COUNT - 1) * BAR_GAP;
-  const int eqX = (128 - eqWidth) / 2;
-  uint32_t t = millis() / 70;
-
-  for (uint8_t i = 0; i < BAR_COUNT; i++) {
-    uint8_t height = 2;
-    if (radioPlaying) {
-      uint32_t wave = (t + i * 3) % 13;
-      height = 4 + ((wave * (i + 3) + i * 5) % (EQ_MAX_HEIGHT - 3));
-    }
-    int x = eqX + i * (BAR_WIDTH + BAR_GAP);
-    int y = EQ_BASELINE - height + 1;
-    display.fillRect(x, y, BAR_WIDTH, height, SSD1306_WHITE);
-  }
-
+  if (line.length() && y < 36) { display.getTextBounds(line.c_str(), 0, 0, &x1, &y1, &w, &h); display.setCursor((128 - (int)w) / 2, y); display.print(line); }
+  constexpr uint8_t BAR_COUNT = 8, BAR_WIDTH = 9, BAR_GAP = 6, EQ_BASELINE = 63, EQ_MAX_HEIGHT = 24;
+  int eqWidth = BAR_COUNT * BAR_WIDTH + (BAR_COUNT - 1) * BAR_GAP, eqX = (128 - eqWidth) / 2; uint32_t t = millis() / 70;
+  for (uint8_t i = 0; i < BAR_COUNT; i++) { uint8_t barHeight = radioPlaying ? 4 + (((t + i * 3) % 13 * (i + 3) + i * 5) % (EQ_MAX_HEIGHT - 3)) : 2; display.fillRect(eqX + i * (BAR_WIDTH + BAR_GAP), EQ_BASELINE - barHeight + 1, BAR_WIDTH, barHeight, SSD1306_WHITE); }
   display.display();
 }
 
-void startStation();
-
-// Cycles through stations in a circle: wrap-around at both ends
 void changeStation(int direction) {
-  int next = static_cast<int>(currentStation) + direction;
-  if (next < 0) next = STATION_COUNT - 1;
-  if (next >= STATION_COUNT) next = 0;
-  currentStation = static_cast<uint8_t>(next);
-  if (WiFi.status() == WL_CONNECTED) { startStation(); radioPlaying = true; }
+  int next = (int)currentStation + direction;
+  if (next < 0) next = stationCount - 1; if (next >= stationCount) next = 0;
+  currentStation = next; saveSettings();
+  if (!sleepMode && WiFi.status() == WL_CONNECTED) { startStation(); radioPlaying = true; }
   updateDisplay(true);
 }
 
 void toggleRadio() {
-  if (radioPlaying) {
-    audio.stopSong();
-    radioPlaying = false;
-    Serial.println("Radio: stopped");
-  } else if (WiFi.status() == WL_CONNECTED) {
-    startStation();
-    radioPlaying = true;
-    Serial.println("Radio: playing");
-  }
+  if (sleepMode) return;
+  if (radioPlaying) { audio.stopSong(); radioPlaying = false; Serial.println("Radio: stopped"); }
+  else if (WiFi.status() == WL_CONNECTED) { startStation(); radioPlaying = true; Serial.println("Radio: playing"); }
 }
 
 void handleShortPress(uint8_t index) {
+  if (sleepMode) return;
   switch (index) {
-    case 0: // Button 1: Previous station
-      if (WiFi.status() == WL_CONNECTED) {
-        changeStation(-1);
-        radioPlaying = true;
-      }
-      break;
-    case 1: // Button 2: Next station
-      if (WiFi.status() == WL_CONNECTED) {
-        changeStation(+1);
-        radioPlaying = true;
-      }
-      break;
-    case 2: // Button 3: Volume down
-      if (volume > 0) volume--;
-      audio.setVolume(volume);
-      Serial.printf("Volume: %u/21\n", volume);
-      break;
-    case 3: // Button 4: Volume up
-      if (volume < 21) volume++;
-      audio.setVolume(volume);
-      Serial.printf("Volume: %u/21\n", volume);
-      break;
-    default:
-      break;
+    case 0: changeStation(-1); break; case 1: changeStation(+1); break;
+    case 2: if (volume > 0) volume--; audio.setVolume(volume); saveSettings(); break;
+    case 3: if (volume < 21) volume++; audio.setVolume(volume); saveSettings(); break;
   }
   updateDisplay(true);
 }
 
-void handleLongPress(uint8_t index) {
-  switch (index) {
-    case 0: // Button 1: Long press -> Play / Pause (toggle)
-      toggleRadio();
-      break;
-    case 1: // Button 2: Long press -> Reserved for custom action
-      // Add your custom long-press action here (e.g. mute, favorite station)
-      Serial.println("Button 2 long press");
-      break;
-    case 2: // Button 3: Long press -> Reserved for custom action
-      // Add your custom long-press action here
-      Serial.println("Button 3 long press");
-      break;
-    case 3: // Button 4: Long press -> Reserved for custom action
-      // Add your custom long-press action here
-      Serial.println("Button 4 long press");
-      break;
-    default:
-      break;
-  }
-  updateDisplay(true);
-}
+void handleLongPress(uint8_t index) { if (index == 0) toggleRadio(); updateDisplay(true); }
 
 void pollButtons() {
   uint32_t now = millis();
   for (uint8_t i = 0; i < 4; i++) {
     bool reading = digitalRead(buttons[i].pin);
-    if (reading != buttons[i].lastReading) {
-      buttons[i].lastChange = now;
-      buttons[i].lastReading = reading;
-    }
+    if (reading != buttons[i].lastReading) { buttons[i].lastChange = now; buttons[i].lastReading = reading; }
     if (now - buttons[i].lastChange >= BUTTON_DEBOUNCE_MS && reading != buttons[i].stableState) {
       buttons[i].stableState = reading;
-      if (reading == LOW) {
-        buttons[i].pressedAt = now;
-        buttons[i].longPressHandled = false;
-      } else if (!buttons[i].longPressHandled) {
-        handleShortPress(i);
-      }
+      if (reading == LOW) { buttons[i].pressedAt = now; buttons[i].longPressHandled = false; }
+      else if (!buttons[i].longPressHandled) handleShortPress(i);
     }
-    if (buttons[i].stableState == LOW && !buttons[i].longPressHandled &&
-        now - buttons[i].pressedAt >= BUTTON_LONG_PRESS_MS) {
-      buttons[i].longPressHandled = true;
-      handleLongPress(i);
-    }
+    if (buttons[i].stableState == LOW && !buttons[i].longPressHandled && now - buttons[i].pressedAt >= BUTTON_LONG_PRESS_MS) { buttons[i].longPressHandled = true; handleLongPress(i); }
   }
 }
 
 void configModeCallback(WiFiManager *myWiFiManager) {
-  inConfigPortal = true;
-  Serial.println("Entered WiFi Config Portal mode");
-  Serial.print("Connect to AP: "); Serial.println(myWiFiManager->getConfigPortalSSID());
-  Serial.print("Portal IP: "); Serial.println(WiFi.softAPIP());
+  inConfigPortal = true; Serial.println("Entered WiFi Config Portal mode"); Serial.print("Connect to AP: "); Serial.println(myWiFiManager->getConfigPortalSSID()); Serial.print("Portal IP: "); Serial.println(WiFi.softAPIP());
   showSetupScreen(myWiFiManager->getConfigPortalSSID().c_str(), WiFi.softAPIP().toString().c_str());
 }
 
 void connectWiFi() {
-  WiFiManager wm;
-  wm.setAPCallback(configModeCallback);
-  wm.setConfigPortalTimeout(180); // 3 minutes timeout if unattended
-
-  Serial.println("Attempting Wi-Fi connection...");
-  bool connected = wm.autoConnect("ESP32-Radio-Setup");
-
-  inConfigPortal = false;
-
-  if (connected) {
-    Serial.print("Wi-Fi connected! IP address: ");
-    Serial.println(WiFi.localIP());
-    startWebServer();
-  } else {
-    Serial.println("Failed to connect or portal timed out.");
-  }
+  WiFiManager wm; wm.setAPCallback(configModeCallback); wm.setConfigPortalTimeout(180);
+  Serial.println("Attempting Wi-Fi connection..."); bool connected = wm.autoConnect("ESP32-Radio-Setup"); inConfigPortal = false;
+  if (connected) { Serial.print("Wi-Fi connected! IP address: "); Serial.println(WiFi.localIP()); startWebServer(); }
+  else Serial.println("Failed to connect or portal timed out.");
   updateDisplay(true);
 }
 
 void startStation() {
-  audio.stopSong();
-  Serial.printf("Station %u/%u: %s\n", currentStation + 1, STATION_COUNT, stationNames[currentStation]);
-  Serial.print("Opening stream: "); Serial.println(stationUrls[currentStation]);
-  if (!audio.connecttohost(stationUrls[currentStation])) Serial.println("Could not open stream.");
-  streamTitle = "";
-  updateDisplay(true);
+  audio.stopSong(); Serial.printf("Station %u/%u: %s\n", currentStation + 1, stationCount, stations[currentStation].name.c_str()); Serial.print("Opening stream: "); Serial.println(stations[currentStation].url);
+  if (!audio.connecttohost(stations[currentStation].url.c_str())) Serial.println("Could not open stream.");
+  streamTitle = ""; updateDisplay(true);
 }
 
-void printStations() {
-  Serial.println("Stations:");
-  for (uint8_t i = 0; i < STATION_COUNT; i++) Serial.printf("  %u: %s\n", i + 1, stationNames[i]);
-}
-
-void printHelp() {
-  Serial.println("Buttons: 1=prev stn (long: play/pause); 2=next stn; 3=vol-; 4=vol+");
-  Serial.println("Long press threshold: 800 ms");
-  Serial.printf("Serial: 1..%u station, n next, p previous, +/- volume, s stop, r restart, l list, h help\n", STATION_COUNT);
-  printStations();
-}
+void printStations() { Serial.println("Stations:"); for (uint8_t i = 0; i < stationCount; i++) Serial.printf("  %u: %s (%s)\n", i + 1, stations[i].name.c_str(), stations[i].url.c_str()); }
+void printHelp() { Serial.println("Buttons: 1=prev, 2=next, 3=vol-, 4=vol+; long 1=play/pause"); Serial.println("Web API: /api/status, /api/stations/add, /api/stations/delete, /api/sleep, /api/wake"); printStations(); }
 
 void setup() {
-  Serial.begin(115200); delay(1000);
-  Serial.println("\nESP32-S3 Stereo Wi-Fi Internet Radio");
-
-  pinMode(BUTTON_PREV, INPUT_PULLUP);
-  pinMode(BUTTON_NEXT, INPUT_PULLUP);
-  pinMode(BUTTON_VOLUME_DOWN, INPUT_PULLUP);
-  pinMode(BUTTON_VOLUME_UP, INPUT_PULLUP);
-
-  Wire.begin(OLED_SDA, OLED_SCL);
-  oledReady = display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS);
-  if (!oledReady) Serial.println("OLED not found at I2C address 0x3C");
-  else { display.clearDisplay(); display.display(); }
-
-  audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
-  audio.setVolume(volume);
-
+  Serial.begin(115200); delay(1000); Serial.println("\nESP32-S3 Stereo Wi-Fi Internet Radio");
+  pinMode(BUTTON_PREV, INPUT_PULLUP); pinMode(BUTTON_NEXT, INPUT_PULLUP); pinMode(BUTTON_VOLUME_DOWN, INPUT_PULLUP); pinMode(BUTTON_VOLUME_UP, INPUT_PULLUP);
+  if (AUDIO_ENABLE_PIN >= 0) { pinMode(AUDIO_ENABLE_PIN, OUTPUT); digitalWrite(AUDIO_ENABLE_PIN, HIGH); }
+  loadSettings(); Wire.begin(OLED_SDA, OLED_SCL); oledReady = display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS);
+  if (!oledReady) Serial.println("OLED not found at I2C address 0x3C"); else { display.clearDisplay(); display.display(); }
+  audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT); audio.setVolume(volume);
   connectWiFi();
-  if (WiFi.status() == WL_CONNECTED) { startStation(); radioPlaying = true; }
+  if (WiFi.status() == WL_CONNECTED && stationCount > 0) { startStation(); radioPlaying = true; }
   printHelp(); updateDisplay(true);
 }
 
 void loop() {
-  audio.loop();
-  pollButtons();
-  updateDisplay();
-  webServer.handleClient();
-
+  if (!sleepMode) { audio.loop(); updateDisplay(); }
+  pollButtons(); webServer.handleClient();
   if (Serial.available()) {
     char command = Serial.read();
-    if (command >= '1' && command <= '0' + STATION_COUNT) {
-      currentStation = static_cast<uint8_t>(command - '1');
-      if (WiFi.status() == WL_CONNECTED) { startStation(); radioPlaying = true; }
-    } else {
-      switch (command) {
-        case '+': if (volume < 21) volume++; audio.setVolume(volume); break;
-        case '-': if (volume > 0) volume--; audio.setVolume(volume); break;
-        case 's': audio.stopSong(); radioPlaying = false; Serial.println("Stopped"); break;
-        case 'r': if (WiFi.status() == WL_CONNECTED) { startStation(); radioPlaying = true; } break;
-        case 'n': if (WiFi.status() == WL_CONNECTED) changeStation(+1); break;
-        case 'p': if (WiFi.status() == WL_CONNECTED) changeStation(-1); break;
-        case 'l': printStations(); break;
-        case 'h': printHelp(); break;
-        default: break;
-      }
+    if (command >= '1' && command <= '0' + stationCount) { currentStation = command - '1'; if (!sleepMode && WiFi.status() == WL_CONNECTED) { startStation(); radioPlaying = true; } saveSettings(); }
+    else switch (command) {
+      case '+': if (volume < 21) volume++; audio.setVolume(volume); saveSettings(); break; case '-': if (volume > 0) volume--; audio.setVolume(volume); saveSettings(); break;
+      case 's': if (!sleepMode) { audio.stopSong(); radioPlaying = false; } break; case 'r': if (!sleepMode && WiFi.status() == WL_CONNECTED) { startStation(); radioPlaying = true; } break;
+      case 'n': if (!sleepMode) changeStation(+1); break; case 'p': if (!sleepMode) changeStation(-1); break; case 'l': printStations(); break; case 'h': printHelp(); break;
+      default: break;
     }
-    if (command == '+' || command == '-') Serial.printf("Volume: %u/21\n", volume);
     updateDisplay(true);
   }
 }

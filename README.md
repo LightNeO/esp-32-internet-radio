@@ -26,6 +26,12 @@ An open-source desktop Internet Radio built on the **ESP32-S3 DevKitC-1 (N16R8)*
   - Accessible from any smartphone or PC browser via `http://<ESP32-IP>/`.
   - Live status indicator (playing/stopped, current station, volume level).
   - Interactive playback buttons and dynamic one-click station selector.
+- **CYD Touchscreen Controller companion**:
+  - Works with the separate [CYD_Controller](https://github.com/LightNeO/CYD_Controller) project.
+  - Target board: Sunton ESP32-2432S022C, 240x320 touchscreen.
+  - The current controller expects this radio at `192.168.50.52`.
+  - It provides Previous, Play/Pause, Next, and Wi-Fi-preserving OFF/ON sleep control.
+  - It does not stream audio; this ESP32-S3 radio remains the audio device.
 - **Custom 3D-Printed Enclosure**: Tailored housing designed specifically for this electronics layout.
 
 ---
@@ -170,6 +176,21 @@ In PlatformIO:
 3. Open **PlatformIO: Serial Monitor** at `115200 baud` to see Wi-Fi status and the assigned IP address.
 
 ---
+
+## CYD Controller companion
+
+The companion touchscreen remote is maintained at [github.com/LightNeO/CYD_Controller](https://github.com/LightNeO/CYD_Controller). A local snapshot is kept as `CYD_Controller_v1` in the related embedded projects folder.
+
+The remote targets the Sunton ESP32-2432S022C and communicates with this radio over HTTP on the local network. Reserve the radio address `192.168.50.52` in the router, or update `RADIO_BASE` in the controller source before building.
+
+The controller uses:
+
+- `GET /api/status` for the station and playback state;
+- `GET /api/prev` and `GET /api/next` for station navigation;
+- `GET /api/toggle` for Play/Pause;
+- `GET /api/sleep` and `GET /api/wake` for the Wi-Fi-connected sleep mode.
+
+Configure the CYD Wi-Fi through the `CYD-Remote-Setup` access point on first boot. Both devices must be connected to the same 2.4 GHz LAN. See the controller README for flashing and troubleshooting details.
 
 ## Web Interface
 
