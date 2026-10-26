@@ -10,6 +10,7 @@
 #include <Adafruit_SSD1306.h>
 #include <WebServer.h>
 #include <WiFiManager.h>
+#include <Update.h>
 #include "Audio.h"
 
 // Defaults are used only on the first boot, or after all saved stations are removed.
@@ -67,6 +68,12 @@ bool sleepMode = false;
 bool resumeAfterSleep = false;
 bool inConfigPortal = false;
 bool volumeSavePending = false;
+bool otaUploadActive = false;
+bool otaUploadAccepted = false;
+bool otaUploadFailed = false;
+
+// OTA is intentionally unauthenticated, but only private RFC1918 LAN clients may upload.
+const char* FIRMWARE_VERSION = "2.7.0-ota";
 uint32_t volumeChangedAt = 0;
 constexpr uint32_t VOLUME_SAVE_DELAY_MS = 3000;
 
@@ -80,6 +87,9 @@ void connectWiFi();
 void printStations();
 void printHelp();
 void setVolumeFromControl(int delta);
+bool isPrivateLanClient();
+void handleOtaUpload();
+void handleOtaFinish();
 
 const char RADIO_PAGE[] PROGMEM = R"rawliteral(
 <!doctype html><html lang="uk"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -93,6 +103,7 @@ input{box-sizing:border-box;background:#333;color:#fff;width:100%;margin:4px 0}f
 <div class="row"><button onclick="cmd('/api/toggle')">Start / Stop</button><button class="secondary" onclick="cmd('/api/prev')">◀ Previous</button><button onclick="cmd('/api/next')">Next ▶</button></div>
 <div class="row"><button class="secondary" onclick="cmd('/api/vdown')">Volume −</button><button onclick="cmd('/api/vup')">Volume +</button></div>
 <div class="row"><button class="secondary" onclick="cmd('/api/sleep')">Sleep</button><button onclick="cmd('/api/wake')">Wake</button></div></div>
+<div class="card"><h2>Firmware Update</h2><p>Current version: 2.7.0-ota</p><form id="otaForm" enctype="multipart/form-data"><label for="firmware">Select firmware.bin</label><input id="firmware" name="firmware" type="file" accept=".bin,application/octet-stream" required><button type="submit">Upload and reboot</button></form></div>
 <div class="card"><h2>Radio Stations</h2><div id="stations"></div><h3>Add a station</h3><form id="addStationForm" onsubmit="addStation(event)"><label for="stationName">Station name</label><input id="stationName" required maxlength="48" autocomplete="off" placeholder="For example: My Radio"><label for="stationUrl">Audio stream URL</label><input id="stationUrl" required type="url" autocomplete="off" placeholder="https://example.com/stream.mp3"><button type="submit">Save station</button></form></div>
 <script>
 const api=async(u,o)=>{let r=await fetch(u,o);if(!r.ok){let t=await r.text();throw Error(t||('HTTP '+r.status))}return r};
@@ -101,6 +112,7 @@ const removeStation=async(i,label)=>{if(confirm('Delete station \"'+label+'\"?')
 const addStation=async(e)=>{e.preventDefault();let nameInput=document.getElementById('stationName'),urlInput=document.getElementById('stationUrl');try{await api('/api/stations/add',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({name:nameInput.value.trim(),url:urlInput.value.trim()})});nameInput.value='';urlInput.value='';await update()}catch(x){alert('Could not save station: '+x.message)}};
 const update=async()=>{try{let s=await (await api('/api/status')).json(),statusEl=document.getElementById('status'),stationsEl=document.getElementById('stations');statusEl.textContent=(s.sleeping?'Sleeping | ':'')+(s.playing?'Playing: ':'Stopped | ')+s.station+' | Volume '+s.volume+'/21 | IP '+s.ip;stationsEl.innerHTML='';s.stations.forEach((x,i)=>{let d=document.createElement('div');d.className='station';let info=document.createElement('span'),title=document.createElement('b'),urlText=document.createElement('small'),play=document.createElement('button'),remove=document.createElement('button');title.textContent=x.name;urlText.textContent=x.url;info.append(title,urlText);play.textContent='▶';play.onclick=()=>cmd('/api/station/'+i);remove.textContent='×';remove.title='Delete station';remove.className='danger';remove.onclick=()=>removeStation(i,x.name);d.append(info,play,remove);stationsEl.appendChild(d)})}catch(e){document.getElementById('status').textContent='Connection error'}};
 update();setInterval(update,3000);
+document.getElementById('otaForm').onsubmit=async e=>{e.preventDefault();let f=document.getElementById('firmware').files[0];if(!f||!confirm('Upload firmware and reboot the radio?'))return;let b=document.querySelector('#otaForm button');b.disabled=true;b.textContent='Uploading...';try{let r=await fetch('/update',{method:'POST',body:new FormData(document.getElementById('otaForm'))});let x=await r.json();alert(x.ok?'Firmware uploaded. Radio is rebooting.':'OTA failed: '+(x.error||'unknown error'));}catch(x){alert('OTA request failed: '+x.message)}finally{b.disabled=false;b.textContent='Upload and reboot'}};
 </script></body></html>
 )rawliteral";
 
@@ -282,6 +294,40 @@ void handleNotFound() {
   sendError(404, "Not found");
 }
 
+bool isPrivateLanClient() {
+  IPAddress ip = webServer.client().remoteIP();
+  uint8_t a = ip[0], b = ip[1];
+  return a == 10 || (a == 172 && b >= 16 && b <= 31) || (a == 192 && b == 168);
+}
+
+void handleOtaUpload() {
+  HTTPUpload& upload = webServer.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    otaUploadActive = false;
+    otaUploadAccepted = isPrivateLanClient() && upload.filename.endsWith(".bin");
+    otaUploadFailed = !otaUploadAccepted;
+    if (!otaUploadAccepted) return;
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) { Update.printError(Serial); otaUploadFailed = true; return; }
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (otaUploadAccepted && !otaUploadFailed && Update.write(upload.buf, upload.currentSize) != upload.currentSize) { Update.printError(Serial); otaUploadFailed = true; }
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (otaUploadAccepted && !otaUploadFailed && Update.end(true)) otaUploadActive = true;
+    else { Update.printError(Serial); otaUploadFailed = true; }
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    Update.abort(); otaUploadFailed = true;
+  }
+}
+
+void handleOtaFinish() {
+  if (!isPrivateLanClient() || !otaUploadActive) {
+    webServer.send(403, "application/json", "{\"ok\":false,\"error\":\"LAN OTA upload failed\"}");
+    return;
+  }
+  webServer.send(200, "application/json", "{\"ok\":true,\"rebooting\":true}");
+  delay(250);
+  ESP.restart();
+}
+
 void startWebServer() {
   webServer.on("/", HTTP_GET, []() { webServer.send_P(200, "text/html; charset=utf-8", RADIO_PAGE); });
   webServer.on("/api/status", HTTP_GET, sendStatus);
@@ -296,6 +342,7 @@ void startWebServer() {
   webServer.on("/api/stations/add", HTTP_GET, apiAddStation);
   webServer.on("/api/stations/delete", HTTP_POST, apiDeleteStation);
   webServer.on("/api/stations/delete", HTTP_GET, apiDeleteStation);
+  webServer.on("/update", HTTP_POST, handleOtaFinish, handleOtaUpload);
   webServer.onNotFound(handleNotFound);
   webServer.begin();
   Serial.print("Web control: http://"); Serial.print(WiFi.localIP()); Serial.println("/");
